@@ -34,6 +34,41 @@ def labelcolormap(N=21):
         cmap[i, 2] = b
     return cmap
 
+def colormap(N=256):
+	# Create double side mappings
+	gray_to_rgb = {}
+	rgb_to_gray = {}
+
+	for i in range(N):
+		temp = i
+		r = 0
+		g = 0
+		b = 0
+		for j in range(8):
+			r = r | ((temp & 1) << (7-j))
+			g = g | (((temp >> 1) & 1) << (7-j))
+			b = b | (((temp >> 2) & 1) << (7-j))
+			temp = temp >> 3
+		gray_to_rgb[i] = (r,g,b)
+
+	for key, val in gray_to_rgb.iteritems():
+		rgb_to_gray[val] = key
+
+	return gray_to_rgb, rgb_to_gray
+
+def seg_gray_to_rgb(seg, gray_to_rgb):
+	row, col = seg.shape
+	rgb = np.zeros((row, col, 3))
+
+	for i in range(row):
+		for j in range(col):
+			r, g, b = gray_to_rgb[seg[i, j]]
+			rgb[i, j, 0] = r
+			rgb[i, j, 1] = g
+			rgb[i, j, 2] = b
+
+	return rgb
+
 def get_seg_batch_func(train_data, dataframe, mc):
     default_ImgLoc = './VOCdevkit/VOC2012/JPEGImages/'
     default_Anno_ImgLoc = './VOCdevkit/VOC2012/SegmentationClass/'
@@ -47,6 +82,9 @@ def get_seg_batch_func(train_data, dataframe, mc):
     print(maps.shape)
     seg_label = np.zeros((Batch_Size, 640, 640))
     obj_label = [[],[],[]]
+    seg_batch = []
+    mask_batch = []
+    gray_to_rgb, rgb_to_gray = colormap()
     for i in range(Batch_Size):
         i_line = np.random.randint(total_data)
         #X.append(train_data[i_line])
@@ -55,6 +93,31 @@ def get_seg_batch_func(train_data, dataframe, mc):
         print(ImgName.split('.'))
         ImgName_ = ImgName.split('.')[0] + '.jpg'
         FileName = default_ImgLoc + ImgName_
+        image = cv2.imread(FileName)
+        image = image - MEAN_PIXEL
+        seg = cv2.imread(default_Anno_ImgLoc+train_data[i_line])[:,:,::-1]
+
+        row, col, _ = image.shape
+
+    	im_blob = np.zeros((640, 640, 3))
+    	im_blob[0:row,0:col,:] = image
+        #image = cv2.resize(image,(640,640))
+
+    	seg_blob = np.zeros((640, 640, 1))
+    	mask = np.zeros_like(seg_blob)
+    	for i in xrange(row):
+    		for j in xrange(col):
+    			seg_blob[i,j] = rgb_to_gray[tuple(seg[i,j,:])]
+    			# Discard 255 edge class
+    			if seg_blob[i,j] != 255:
+    				mask[i,j] = 1
+    			else:
+    				seg_blob[i,j] = 0
+        cv2.imwrite('./outs/_'+str(i_line)+".jpg", mask)
+        cv2.imwrite('./outs/'+str(i_line)+".jpg", seg_blob)
+        seg_batch.append(seg_blob)
+        mask_batch.append(mask)
+        """
         image = misc.imresize(misc.imread(FileName), (640,640))
         image = image - MEAN_PIXEL
         gt_image = misc.imresize(misc.imread(default_Anno_ImgLoc+train_data[i_line]), (640,640))
@@ -76,9 +139,10 @@ def get_seg_batch_func(train_data, dataframe, mc):
 
         cv2.imwrite('./outs/_'+str(i_line)+".jpg", result_img_)
         cv2.imwrite('./outs/'+str(i_line)+".jpg", seg_label[i])
-        f_x.append(image)
-        seg_per_batch.append(gt_image)
-    return f_x, seg_label#seg_per_batch
+        """
+        f_x.append(im_blob)
+        #seg_per_batch.append(gt_image)
+    return f_x, seg_batch,mask_batch #seg_label#seg_per_batch
 
 def fcn(mc):
     num_classes = 21
@@ -90,8 +154,8 @@ def fcn(mc):
             [None, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH, 3], name = 'BottleneckInputPlaceholder'
         )
         #seg  = tf.placeholder(tf.int32,[None, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH, 1], name = 'SegmentGroundTruth')
-        seg = tf.placeholder(tf.int32,[mc.BATCH_SIZE, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH, 1], name = 'SegmentGroundTruth')
-        #mask = tf.placeholder(tf.float32,[mc.BATCH_SIZE, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH, 1], name = 'MaskedGroundTruth')
+        seg = tf.placeholder(tf.int32,[mc.BATCH_SIZE, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH,1], name = 'SegmentGroundTruth')
+        mask = tf.placeholder(tf.float32,[mc.BATCH_SIZE, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH, 1], name = 'MaskedGroundTruth')
         keep_prob = tf.placeholder(tf.float32, name='keep_prob')
     # Conv1
     with tf.variable_scope('conv1_1') as scope:
@@ -272,13 +336,18 @@ def fcn(mc):
             [mc.BATCH_SIZE, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH, num_classes],
             strides=[1,32,32,1], padding='SAME', name='z') + b_deconv
     pred = z_deconv
-    #annotation_pred_ = tf.nn.softmax(z_deconv, name="prediction")
+    annotation_pred = tf.nn.softmax(z_deconv, name="prediction")
+    annotation_pred = tf.argmax(z_deconv, axis = 3)
     #print(annotation_pred)
-    annotation_pred = tf.argmax(pred, axis = 3)
     pred_reshape = tf.reshape(pred, [-1, num_classes])
     gt_reshape = tf.reshape(seg, [-1])
-    cross_entropy = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=gt_reshape,logits=pred_reshape)
-    loss_avg=tf.reduce_mean(cross_entropy)
+
+    loss_reshape = tf.nn.sparse_softmax_cross_entropy_with_logits(labels = gt_reshape, logits = pred_reshape)
+    loss = tf.reshape(loss_reshape, [mc.BATCH_SIZE, mc.IMAGE_HEIGHT , mc.IMAGE_WIDTH, 1])
+    loss_valid = tf.reduce_sum(loss * mask, (1,2,3))
+
+    valid_pixels = tf.reduce_sum(mask, (1,2,3))
+    loss_avg = tf.reduce_mean(loss_valid / valid_pixels)
     #loss_avg = logistic_loss(logits, seg, num_classes)
     global_step = tf.Variable(0, trainable=False, name='global_step')
     lr = tf.train.exponential_decay(mc.LEARNING_RATE,
@@ -290,28 +359,30 @@ def fcn(mc):
     #with tf.control_dependencies([self.centers_update_op]):
     train_step = optimizer.minimize(loss_avg, global_step=global_step)
 
-    return train_step, annotation_pred,loss_avg, bottleneck_input, seg, keep_prob
+    return train_step, annotation_pred,loss_avg, bottleneck_input, seg,mask, keep_prob
 
 def featuremap_extract(data, df):
     img_channel_mean = [103.939, 116.779, 123.68]
     mc = model_params()
     BATCH_SIZE = mc.BATCH_SIZE
-    mapss = labelcolormap()
+    #mapss = labelcolormap()
+    gray_to_rgb, rgb_to_gray = colormap()
     with tf.Session() as sess:
-        train_step, pred,loss_avg, bottleneck_input, seg, keep_prob = fcn(mc)
+        train_step, pred,loss_avg, bottleneck_input, seg,mask, keep_prob = fcn(mc)
         init = tf.initialize_all_variables()
         sess.run(init)
         Total_iter = 3000
         for i in range(Total_iter):
-            f_x, seg_label = get_seg_batch_func(data, df,mc)
-            losses = sess.run([train_step, pred,loss_avg], feed_dict = {bottleneck_input: f_x, seg: seg_label, keep_prob: 0.7})
+            f_x, seg_batch,mask_batch = get_seg_batch_func(data, df,mc)
+            losses = sess.run([train_step, pred,loss_avg], feed_dict = {bottleneck_input: f_x, seg: seg_batch, mask: mask_batch, keep_prob: 0.7})
             print('step {0}, losses is {1}'.format(i,losses[-1]))
             for n in range(mc.BATCH_SIZE):
                 result_img = np.array(losses[-2][n])
                 print(result_img.shape)
                 #result_img = np.squeeze(result_img, axis=2)
-                print(result_img)
+                #print(result_img)
                 #reshape = np.reshape(result_img,[640,640,21])
+                """
                 result_img_ = np.zeros((640,640,3))
                 for r in range(640):
                     for c in range(640):
@@ -320,6 +391,8 @@ def featuremap_extract(data, df):
                                 result_img_[r,c,0] = mapss[idx,0]
                                 result_img_[r,c,1] = mapss[idx,1]
                                 result_img_[r,c,2] = mapss[idx,2]
+                """
+                result_img_ = seg_gray_to_rgb(result_img, gray_to_rgb)
                 #convert to rgb
                 #print(losses[-1][n])
                 #print(seg_)
